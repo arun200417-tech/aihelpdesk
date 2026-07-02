@@ -45,6 +45,10 @@ class Settings(BaseSettings):
     rag_top_k: int = 4
 
     # --- External LLM provider (Gemini only) ---
+    # When true (and a key is set), embeddings use Gemini ONLY — the hashing/ST
+    # fallbacks are disabled so no near-random vectors are ever used. RAG answers
+    # are always Gemini-generated; there is no fallback answer generator.
+    require_gemini: bool = True
     gemini_api_key: str = ""
     # flash-lite: much higher free-tier daily quota than gemini-2.5-flash.
     gemini_model: str = "gemini-2.5-flash-lite"

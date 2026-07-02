@@ -62,6 +62,17 @@ def _resolve_backend() -> None:
             _backend = f"gemini/{settings.gemini_embedding_model}"
             logger.info("Embedding backend ACTIVE: %s (dim=%s)", _backend, dim)
             return
+        if settings.require_gemini:
+            # REQUIRE_GEMINI: never fall back to hashing/ST. Stay on Gemini and
+            # retry per call; a persistent failure yields a dimension-safe zero
+            # vector (no false matches), never near-random hashing vectors.
+            _mode = "gemini"
+            _gemini_dim = 3072
+            _backend = f"gemini/{settings.gemini_embedding_model} (retry-per-call, no fallback)"
+            logger.error(
+                "REQUIRE_GEMINI=true: Gemini embeddings not reachable at startup. Will retry "
+                "each call and will NOT use the hashing fallback. Check GEMINI_API_KEY / network.")
+            return
         logger.error(
             "Gemini embeddings unavailable after %d attempts; trying local backends. "
             "Check GEMINI_API_KEY, network/TLS (DISABLE_SSL_VERIFY or CA_BUNDLE).", _RETRIES,
