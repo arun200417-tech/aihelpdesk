@@ -12,11 +12,7 @@ venv/
 env/
 .pytest_cache/
 
-# Runtime data (DB, vector store, uploads) — not source-controlled
-data/helpdesk.db
-data/helpdesk.db-*
-data/chroma/
-data/uploads/
+
 
 # OS / editor
 .DS_Store
