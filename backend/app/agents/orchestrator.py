@@ -5,7 +5,10 @@ Pipeline (each step is audited via the Audit Agent for AI governance, FR-12):
   2. Intent      — classify category + intent.
   3. Priority    — score urgency.
   4. Duplicate   — vector-similarity vs open tickets:
-                     * merge tier  -> auto-resolve from the original's resolution.
+                     * merge tier, original resolved   -> reuse its resolution.
+                     * merge tier, original unresolved -> fetch a KB solution and
+                       share it with the duplicate (auto-resolve) if one exists;
+                       otherwise just link them so the team handles them together.
                      * suggest tier -> keep suggestions, continue to RAG.
   5. RAG         — KB retrieval + LLM -> grounded answer + confidence.
   6. Decision    — confidence >= threshold -> auto-resolve with citations;
@@ -106,23 +109,43 @@ class AgentOrchestrator:
             upsert_ticket_embedding(ticket.id, steps_text, ticket.status)
             dup_id = dup_res.output.get("duplicate_of_id")
             original = self.tickets.get(dup_id) if dup_id else None
-            if self._resolve_as_duplicate(ticket, dup_res, original, steps):
-                return steps, suggestions
-            # Original has no resolution yet -> link as duplicate with a clear reason.
-            ticket.status = TicketStatus.DUPLICATE
             ticket.duplicate_of_id = dup_id
-            ticket.first_response_at = _now()
+            # (a) The matched original already has a resolution -> reuse it.
+            if self._resolve_as_duplicate(ticket, dup_res, original, steps):
+                upsert_ticket_embedding(ticket.id, steps_text, ticket.status)
+                return steps, suggestions
+            # (b) The original has no resolution YET, but the issue may already be
+            #     answered in the knowledge base. Fetch that solution and share it
+            #     with this duplicate ticket instead of leaving it unresolved.
+            if self._share_kb_solution(ticket, steps_text, steps, original):
+                upsert_ticket_embedding(ticket.id, steps_text, ticket.status)
+                return steps, suggestions
+            # (c) No KB solution either -> link as duplicate with a clear reason.
+            ticket.status = TicketStatus.DUPLICATE
+            ticket.first_response_at = ticket.first_response_at or _now()
             ticket.routing_reason = self._duplicate_reason(ticket, original, resolved=False)
             self.audit.event(event="linked_duplicate", ticket_id=ticket.id, detail=ticket.routing_reason)
             self._trace(steps, AgentResult(
                 "DuplicateResolver", "linked_duplicate",
                 detail=ticket.routing_reason, confidence=dup_res.confidence))
+            upsert_ticket_embedding(ticket.id, steps_text, ticket.status)
             return steps, suggestions
 
         # Index this ticket so later submissions can detect it as a duplicate.
         upsert_ticket_embedding(ticket.id, steps_text, ticket.status)
 
-        # --- Step 5: RAG knowledge search + candidate response ---
+        # --- Steps 5 & 6: RAG knowledge search + resolution decision ---
+        self._resolve_new_ticket(ticket, steps_text, steps)
+
+        # Refresh stored embedding with the final status.
+        upsert_ticket_embedding(ticket.id, steps_text, ticket.status)
+        return steps, suggestions
+
+    def _run_rag(self, ticket: Ticket, steps_text: str,
+                 steps: list[dict]) -> tuple[bool, str | None, float]:
+        """Step 5 — KB retrieval + grounded answer. Records citations on the
+        ticket, bumps article retrieval counts, and returns
+        (has_kb_match, answer, confidence) for the caller's decision."""
         rag_res = self.rag.run(steps_text)
         self.audit.record(rag_res, ticket.id)
         self._trace(steps, rag_res)
@@ -131,56 +154,74 @@ class AgentOrchestrator:
         for src in sources:
             if src.get("article_id"):
                 self.article_repo.increment_retrieval(src["article_id"])
-
-        # --- Step 6: Resolution decision (KB-match + confidence workflow) ---
-        # Rule 1: KB match AND confidence >= threshold  -> auto-resolve.
-        # Rule 2: KB match but confidence < threshold    -> escalate to L2.
-        # Rule 3: no KB match but recognized category     -> escalate to L2.
-        # Rule 4: no KB match and no recognized category  -> leave In Progress.
-        threshold = settings.ai_confidence_threshold
-        answer = rag_res.output.get("answer")
+        ticket.kb_sources = json.dumps(sources)  # keep KB citations for context
         retrieval = rag_res.output.get("retrieval_strength", 0.0) or 0.0
         has_kb_match = retrieval >= settings.kb_match_min_score
+        return has_kb_match, rag_res.output.get("answer"), ticket.confidence
+
+    def _auto_resolve_from_kb(self, ticket: Ticket, answer: str,
+                              steps: list[dict], note: str) -> None:
+        """Apply a knowledge-base solution to the ticket (auto-resolution)."""
+        ticket.status = TicketStatus.RESOLVED
+        ticket.resolution = answer
+        ticket.resolution_source = "auto"
+        ticket.resolved_at = _now()
+        ticket.routing_reason = note
+        self.audit.event(event="auto_resolved", ticket_id=ticket.id, detail=note)
+        self._trace(steps, AgentResult(
+            "ConfidenceCheck", "auto_resolved", detail=note, confidence=ticket.confidence))
+
+    def _resolve_new_ticket(self, ticket: Ticket, steps_text: str, steps: list[dict]) -> None:
+        """Step 6 — resolution decision for a non-duplicate ticket.
+          Rule 1: KB match AND confidence >= threshold  -> auto-resolve.
+          Rule 2: KB match but confidence < threshold    -> escalate to L2.
+          Rule 3: no KB match but recognized category     -> escalate to L2.
+          Rule 4: no KB match and no recognized category  -> leave In Progress."""
+        threshold = settings.ai_confidence_threshold
+        has_kb_match, answer, confidence = self._run_rag(ticket, steps_text, steps)
         recognized_category = bool(ticket.category) and ticket.category != "Other"
-        ticket.kb_sources = json.dumps(sources)  # keep KB citations for context
         ticket.first_response_at = _now()
 
-        if has_kb_match and ticket.confidence >= threshold and answer:
-            # Rule 1 — auto-resolve from the knowledge base.
-            ticket.status = TicketStatus.RESOLVED
-            ticket.resolution = answer
-            ticket.resolution_source = "auto"
-            ticket.resolved_at = _now()
-            note = f"Applied KB solution (confidence {ticket.confidence:.0%} >= {threshold:.0%})."
-            ticket.routing_reason = note
-            self.audit.event(event="auto_resolved", ticket_id=ticket.id, detail=note)
-            self._trace(steps, AgentResult(
-                "ConfidenceCheck", "auto_resolved", detail=note, confidence=ticket.confidence))
+        if has_kb_match and confidence >= threshold and answer:
+            self._auto_resolve_from_kb(
+                ticket, answer, steps,
+                note=f"Applied KB solution (confidence {confidence:.0%} >= {threshold:.0%}).")
         elif has_kb_match:
-            # Rule 2 — KB matched but low/ambiguous confidence -> escalate to L2.
             self._escalate_to_l2(
                 ticket, steps,
-                note=(f"KB match found but AI confidence {ticket.confidence:.0%} is below "
+                note=(f"KB match found but AI confidence {confidence:.0%} is below "
                       f"{threshold:.0%} (ambiguous). Escalated to L2 for manual review."))
         elif recognized_category:
-            # Rule 3 — no confident KB solution, but a valid category -> escalate to L2.
             self._escalate_to_l2(
                 ticket, steps,
                 note=(f"No confident KB solution for this {ticket.category} issue. "
                       f"Escalated to L2 support."))
         else:
-            # Rule 4 — no KB match and no recognized category -> leave In Progress.
             ticket.status = TicketStatus.IN_PROGRESS
             ticket.routing_reason = "Awaiting further classification or KB entry."
             self.audit.event(event="awaiting_classification", ticket_id=ticket.id,
                              detail=ticket.routing_reason)
             self._trace(steps, AgentResult(
                 "ConfidenceCheck", "awaiting_classification",
-                detail=ticket.routing_reason, confidence=ticket.confidence))
+                detail=ticket.routing_reason, confidence=confidence))
 
-        # Refresh stored embedding with the final status.
-        upsert_ticket_embedding(ticket.id, steps_text, ticket.status)
-        return steps, suggestions
+    def _share_kb_solution(self, ticket: Ticket, steps_text: str, steps: list[dict],
+                           original: Ticket | None) -> bool:
+        """A duplicate whose original is not resolved yet: if the knowledge base
+        already contains a confident solution for this issue, share it with the
+        ticket (auto-resolve while keeping the duplicate link). Returns True if a
+        KB solution was applied, False to fall back to plain duplicate linking."""
+        threshold = settings.ai_confidence_threshold
+        has_kb_match, answer, confidence = self._run_rag(ticket, steps_text, steps)
+        ticket.first_response_at = _now()
+        if has_kb_match and confidence >= threshold and answer:
+            oid = original.id if original else ticket.duplicate_of_id
+            note = (f"This is similar to ticket #{oid}, which isn't resolved yet — but the "
+                    f"knowledge base already had a solution, so we applied it for you "
+                    f"(confidence {confidence:.0%}).")
+            self._auto_resolve_from_kb(ticket, answer, steps, note=note)
+            return True
+        return False
 
     def _resolve_as_duplicate(self, ticket: Ticket, dup_res: AgentResult,
                               original: Ticket | None, steps: list[dict]) -> bool:
